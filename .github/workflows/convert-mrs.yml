@@ -21,7 +21,7 @@ jobs:
 
       - name: Install Mihomo CLI
         run: |
-          go install github.com/metacubex/mihomo@latest  # 使用 go.mod 声明路径修复冲突
+          go install github.com/metacubex/mihomo@latest
           sudo cp ~/go/bin/mihomo /usr/local/bin/
 
       - name: Process each TXT URL
@@ -29,16 +29,47 @@ jobs:
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
           DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
           CHANGED=false
+          PROCESSED=0
 
-          for URL in "${URLS[@]}"; do
+          for RAW_URL in "${URLS[@]}"; do
+            # 清理 URL：修剪空格，跳过空
+            URL=$(echo "$RAW_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -z "$URL" ]; then
+              echo "Skipping empty URL"
+              continue
+            fi
+            
+            echo "Raw URL: '$RAW_URL' -> Cleaned URL: '$URL'"
+            
+            # 预验证：检查 URL 格式和可访问性
+            if ! [[ "$URL" =~ ^https?:// ]]; then
+              echo "Invalid URL format (no http(s)://): $URL"
+              continue
+            fi
+            
+            if ! curl -f -s --head -L "$URL" >/dev/null 2>&1; then
+              echo "URL not accessible (HEAD check failed): $URL"
+              continue
+            fi
+            
             # 下载 TXT
-            curl -L -o temp.txt "$URL"
+            if ! curl -L -o temp.txt -f "$URL"; then
+              echo "Failed to download: $URL"
+              rm -f temp.txt
+              continue
+            fi
             
-            # 提取文件名：从 URL 末尾取 basename，去 .txt 加 .mrs
+            # 提取文件名
             FILENAME=$(basename "$URL" .txt).mrs
-            if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi  # 防重复
+            if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi
             
-            # 判断类型
+            # 判断类型（仅如果文件非空）
+            if [ ! -s temp.txt ]; then
+              echo "Empty file, skipping: $URL"
+              rm -f temp.txt
+              continue
+            fi
+            
             if grep -qiE "(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD)" temp.txt 2>/dev/null; then
               BEHAVIOR="domain"
             elif grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp.txt 2>/dev/null; then
@@ -50,13 +81,16 @@ jobs:
             echo "Processing $URL -> $FILENAME (type: $BEHAVIOR)"
             
             # 转换
-            mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME"
-            
-            # 如果文件变化，标记为已更改
-            if [[ -f "$FILENAME" && ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
-              cp "$FILENAME" "$FILENAME.bak" || true
-              CHANGED=true
-              git add "$FILENAME"
+            if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME"; then
+              # 检查变化
+              if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
+                cp "$FILENAME" "$FILENAME.bak" || true
+                CHANGED=true
+                git add "$FILENAME"
+                ((PROCESSED++))
+              fi
+            else
+              echo "Conversion failed for: $FILENAME"
             fi
             
             rm -f temp.txt "$FILENAME.bak"
@@ -66,9 +100,9 @@ jobs:
           if [[ "$CHANGED" == true ]]; then
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
-            git commit -m "Update MRS files from multiple TXT URLs [$(date +'%Y-%m-%d')]"
+            git commit -m "Update $PROCESSED MRS files from TXT URLs [$(date +'%Y-%m-%d')]"
             git push
-            echo "Updated MRS files"
+            echo "Successfully updated $PROCESSED MRS files"
           else
             echo "No changes to commit"
           fi
