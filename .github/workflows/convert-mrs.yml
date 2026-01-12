@@ -1,9 +1,9 @@
-name: Convert Multiple TXT to MRS
+name: Convert Multiple TXT to MRS (Improved)
 
 on:
   schedule:
-    - cron: '0 0 * * *' # 每天凌晨 0:00 自动运行
-  workflow_dispatch: # 支持手动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Go (for Mihomo CLI)
+      - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
@@ -27,95 +27,76 @@ jobs:
           go install github.com/metacubex/mihomo@latest
           sudo cp ~/go/bin/mihomo /usr/local/bin/
 
-      - name: Process each TXT URL
+      - name: Process Rulesets
         run: |
           set +e
-          # 从 GitHub Repository Variables 读取 URL 列表
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
-          DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
           CHANGED=false
           PROCESSED=0
 
           for RAW_URL in "${URLS[@]}"; do
-            # 清理 URL 字符串中的空格
             URL=$(echo "$RAW_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
             echo "-------------------------------------------------------"
-            echo "Downloading: $URL"
-            
-            if ! curl -L -o temp_raw.txt -f --max-time 30 "$URL"; then
-              echo "Error: Failed to download $URL"
-              continue
-            fi
-
-            # 移除 BOM 头并检查内容
+            echo "Fetching: $URL"
+            if ! curl -L -o temp_raw.txt -f --max-time 30 "$URL"; then continue; fi
             sed -i '1s/^\xEF\xBB\xBF//' temp_raw.txt
-            if [ ! -s temp_raw.txt ]; then echo "Empty file, skipping."; continue; fi
 
-            # 1. 自动判断 Behavior (IP 类 vs 域名类)
+            # 1. 预判断：是 IP 类规则还是域名类规则
             if grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp_raw.txt 2>/dev/null; then
               BEHAVIOR="ipcidr"
-              cp temp_raw.txt temp.txt
-              echo "Detected Type: IP-CIDR"
+              echo "Type: IP-CIDR. Stripping prefixes..."
+              # 仅保留 IP 段：移除 IP-CIDR, 前缀和行尾的 ,no-resolve 等参数
+              grep -v '^[[:space:]]*#' temp_raw.txt | grep -v '^[[:space:]]*$' | sed -E '
+                  s/^(IP-CIDR|IP-CIDR6|IP-6-CIDR),//gi; 
+                  s/,[^, ]+$//g;
+              ' > temp.txt
             else
               BEHAVIOR="domain"
-              echo "Detected Type: Domain (Applying Wildcard Logic)"
-              
-              # 2. 执行核心转换逻辑：
-              # - 忽略空行和注释
-              # - DOMAIN-KEYWORD -> *keyword*
-              # - DOMAIN/DOMAIN-SUFFIX/纯域名 -> +.domain.com
-              grep -v '^[[:space:]]*$' temp_raw.txt | grep -v '^[[:space:]]*#' | sed -E '
-                  /^DOMAIN-KEYWORD,/ {
-                      s/^DOMAIN-KEYWORD,([^,]+).*/\*\1\*/;
-                      b;
-                  }
-                  s/^(DOMAIN-SUFFIX|DOMAIN),//g;
-                  s/^[[:space:]]*//;
-                  s/^\+\.//;
-                  s/^\.//;
-                  s/^/+\./;
-              ' > temp.txt
+              # 2. 域名类预处理：检查是否已经是字符通配格式
+              # 如果文件中已经包含 "+." 或 "*"，则视为已经是通配符格式
+              if grep -qE "(\+\.|\*)" temp_raw.txt; then
+                echo "Type: Domain (Pre-formatted). Skipping modification..."
+                cp temp_raw.txt temp.txt
+              else
+                echo "Type: Domain (Standard). Applying transformation..."
+                # 处理逻辑：
+                # - DOMAIN-KEYWORD -> *keyword*
+                # - DOMAIN-SUFFIX -> +.domain
+                # - DOMAIN -> 保持原样 (仅移除 DOMAIN, 前缀以符合 Mihomo 格式)
+                grep -v '^[[:space:]]*#' temp_raw.txt | grep -v '^[[:space:]]*$' | sed -E '
+                    /^DOMAIN-KEYWORD,/ { s/^DOMAIN-KEYWORD,([^,]+).*/\*\1\*/; b; }
+                    /^DOMAIN-SUFFIX,/ { s/^DOMAIN-SUFFIX,([^,]+).*/\+\.\1/; b; }
+                    /^DOMAIN,/ { s/^DOMAIN,([^,]+).*/\1/; b; }
+                    # 如果是没有前缀的纯域名，按 DOMAIN 处理，不加通配符
+                    s/^[[:space:]]*//;
+                ' > temp.txt
+              fi
             fi
 
-            # 预览前 5 行转换结果
-            echo "Sample Output:"
-            head -n 5 temp.txt | sed 's/^/  /'
-
-            # 3. 编译为 MRS 文件
+            # 3. 编译 MRS
             FILENAME=$(basename "$URL" .txt).mrs
-            if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2> mihomo_err.log; then
-              echo "Success: $FILENAME generated."
-              
-              # 检查内容是否有变化 (通过对比备份文件)
+            if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2>/dev/null; then
+              echo "Successfully converted: $FILENAME"
               if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
                 cp "$FILENAME" "$FILENAME.bak"
                 CHANGED=true
                 git add "$FILENAME"
                 ((PROCESSED++))
               fi
-            else
-              echo "Error: Mihomo conversion failed for $FILENAME"
-              cat mihomo_err.log
             fi
-            
-            rm -f temp_raw.txt temp.txt mihomo_err.log
+            rm -f temp_raw.txt temp.txt
           done
           
-          set -e
-          
-          # 4. 提交并推送更改
           if [[ "$CHANGED" == true ]]; then
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
-            git commit -m "Auto-update: $PROCESSED MRS files [$(date +'%Y-%m-%d')]"
+            git commit -m "Ruleset Update: $PROCESSED files [$(date +'%Y-%m-%d')]"
             git push
-            echo "Workflow complete. Updated $PROCESSED files."
-          else
-            echo "No changes detected in any rulesets."
           fi
+          set -e
 
       - name: Cleanup
         if: always()
-        run: rm -f temp_raw.txt temp.txt *.bak mihomo_err.log
+        run: rm -f temp_raw.txt temp.txt *.bak
