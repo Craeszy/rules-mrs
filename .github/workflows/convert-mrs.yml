@@ -26,6 +26,7 @@ jobs:
 
       - name: Process each TXT URL
         run: |
+          set +e  # 关键：禁用 set -e，让单个失败不中断整体
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
           DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
           CHANGED=false
@@ -47,28 +48,31 @@ jobs:
               continue
             fi
             
-            if ! curl -f -s --head -L "$URL" >/dev/null 2>&1; then
+            if ! curl -f -s --head -L --max-time 10 "$URL" >/dev/null 2>&1; then  # 新增：超时 10s
               echo "URL not accessible (HEAD check failed): $URL"
               continue
             fi
             
-            # 下载 TXT
-            if ! curl -L -o temp.txt -f "$URL"; then
+            # 下载 TXT（新增：移除 BOM）
+            if ! curl -L -o temp.txt -f --max-time 30 "$URL"; then  # 新增：超时 30s
               echo "Failed to download: $URL"
               rm -f temp.txt
               continue
             fi
+            sed -i '1s/^\xEF\xBB\xBF//' temp.txt  # 新增：移除 UTF-8 BOM
             
             # 提取文件名
             FILENAME=$(basename "$URL" .txt).mrs
             if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi
             
-            # 判断类型（仅如果文件非空）
+            # 判断类型（仅如果文件非空）+ 调试：echo 前 5 行
             if [ ! -s temp.txt ]; then
               echo "Empty file, skipping: $URL"
               rm -f temp.txt
               continue
             fi
+            echo "Sample content (first 5 lines):"
+            head -n 5 temp.txt | sed 's/^/  /'  # 新增：日志调试内容
             
             if grep -qiE "(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD)" temp.txt 2>/dev/null; then
               BEHAVIOR="domain"
@@ -80,21 +84,31 @@ jobs:
             
             echo "Processing $URL -> $FILENAME (type: $BEHAVIOR)"
             
-            # 转换
-            if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME"; then
+            # 转换（关键：捕获输出，失败 continue）
+            if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2> mihomo_err.log; then
+              echo "Conversion successful for: $FILENAME"
               # 检查变化
               if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
-                cp "$FILENAME" "$FILENAME.bak" || true
+                mv "$FILENAME.bak" "$FILENAME.old" 2>/dev/null || true  # 新增：重命名旧备份
+                cp "$FILENAME" "$FILENAME.bak"
                 CHANGED=true
                 git add "$FILENAME"
                 ((PROCESSED++))
               fi
             else
-              echo "Conversion failed for: $FILENAME"
+              ERROR_CODE=$?
+              echo "Conversion failed for: $FILENAME (exit code: $ERROR_CODE)"
+              if [ -s mihomo_err.log ]; then
+                echo "Mihomo stderr:"
+                cat mihomo_err.log | sed 's/^/  /'  # 新增：显示错误详情
+              fi
+              rm -f "$FILENAME" mihomo_err.log  # 清理失败文件
+              continue  # 关键：继续下一个 URL
             fi
             
-            rm -f temp.txt "$FILENAME.bak"
+            rm -f temp.txt "$FILENAME.bak" mihomo_err.log
           done
+          set -e  # 恢复 set -e（可选，后续步骤需严格）
           
           # 提交如果有变化
           if [[ "$CHANGED" == true ]]; then
@@ -109,4 +123,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: rm -f temp.txt *.bak
+        run: rm -f temp.txt *.bak mihomo_err.log *.old
