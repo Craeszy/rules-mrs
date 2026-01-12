@@ -21,7 +21,7 @@ jobs:
 
       - name: Install Mihomo CLI
         run: |
-          go install github.com/MetaCubeX/mihomo@latest
+          go install github.com/metacubex/mihomo@latest  # 使用 go.mod 声明路径修复冲突
           sudo cp ~/go/bin/mihomo /usr/local/bin/
 
       - name: Process each TXT URL
@@ -68,7 +68,7 @@ jobs:
             git config --local user.name "GitHub Action"
             git commit -m "Update MRS files from multiple TXT URLs [$(date +'%Y-%m-%d')]"
             git push
-            echo "Updated $(echo "$CHANGED" | wc -l) MRS files"
+            echo "Updated MRS files"
           else
             echo "No changes to commit"
           fi
