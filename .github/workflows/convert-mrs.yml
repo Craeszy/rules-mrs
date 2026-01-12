@@ -2,11 +2,12 @@ name: Convert Multiple TXT to MRS
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
+    - cron: '0 0 * * *' # 每天凌晨 0:00 自动运行
+  workflow_dispatch: # 支持手动触发
 
 permissions:
   contents: write
+
 jobs:
   convert:
     runs-on: ubuntu-latest
@@ -29,92 +30,92 @@ jobs:
       - name: Process each TXT URL
         run: |
           set +e
+          # 从 GitHub Repository Variables 读取 URL 列表
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
           DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
           CHANGED=false
           PROCESSED=0
 
           for RAW_URL in "${URLS[@]}"; do
+            # 清理 URL 字符串中的空格
             URL=$(echo "$RAW_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-            if [ -z "$URL" ]; then
-              echo "Skipping empty URL"
+            if [ -z "$URL" ]; then continue; fi
+            
+            echo "-------------------------------------------------------"
+            echo "Downloading: $URL"
+            
+            if ! curl -L -o temp_raw.txt -f --max-time 30 "$URL"; then
+              echo "Error: Failed to download $URL"
               continue
             fi
-            
-            echo "Raw URL: '$RAW_URL' -> Cleaned URL: '$URL'"
-            
-            if ! [[ "$URL" =~ ^https?:// ]]; then
-              echo "Invalid URL format (no http(s)://): $URL"
-              continue
-            fi
-            
-            if ! curl -f -s --head -L --max-time 10 "$URL" >/dev/null 2>&1; then
-              echo "URL not accessible (HEAD check failed): $URL"
-              continue
-            fi
-            
-            if ! curl -L -o temp.txt -f --max-time 30 "$URL"; then
-              echo "Failed to download: $URL"
-              rm -f temp.txt
-              continue
-            fi
-            sed -i '1s/^\xEF\xBB\xBF//' temp.txt
-            
-            FILENAME=$(basename "$URL" .txt).mrs
-            if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi
-            
-            if [ ! -s temp.txt ]; then
-              echo "Empty file, skipping: $URL"
-              rm -f temp.txt
-              continue
-            fi
-            echo "Sample content (first 5 lines):"
-            head -n 5 temp.txt | sed 's/^/  /'
-            
-            if grep -qiE "(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD)" temp.txt 2>/dev/null; then
-              BEHAVIOR="domain"
-            elif grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp.txt 2>/dev/null; then
+
+            # 移除 BOM 头并检查内容
+            sed -i '1s/^\xEF\xBB\xBF//' temp_raw.txt
+            if [ ! -s temp_raw.txt ]; then echo "Empty file, skipping."; continue; fi
+
+            # 1. 自动判断 Behavior (IP 类 vs 域名类)
+            if grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp_raw.txt 2>/dev/null; then
               BEHAVIOR="ipcidr"
+              cp temp_raw.txt temp.txt
+              echo "Detected Type: IP-CIDR"
             else
-              BEHAVIOR="$DEFAULT_BEHAVIOR"
+              BEHAVIOR="domain"
+              echo "Detected Type: Domain (Applying Wildcard Logic)"
+              
+              # 2. 执行核心转换逻辑：
+              # - 忽略空行和注释
+              # - DOMAIN-KEYWORD -> *keyword*
+              # - DOMAIN/DOMAIN-SUFFIX/纯域名 -> +.domain.com
+              grep -v '^[[:space:]]*$' temp_raw.txt | grep -v '^[[:space:]]*#' | sed -E '
+                  /^DOMAIN-KEYWORD,/ {
+                      s/^DOMAIN-KEYWORD,([^,]+).*/\*\1\*/;
+                      b;
+                  }
+                  s/^(DOMAIN-SUFFIX|DOMAIN),//g;
+                  s/^[[:space:]]*//;
+                  s/^\+\.//;
+                  s/^\.//;
+                  s/^/+\./;
+              ' > temp.txt
             fi
-            
-            echo "Processing $URL -> $FILENAME (type: $BEHAVIOR)"
-            
+
+            # 预览前 5 行转换结果
+            echo "Sample Output:"
+            head -n 5 temp.txt | sed 's/^/  /'
+
+            # 3. 编译为 MRS 文件
+            FILENAME=$(basename "$URL" .txt).mrs
             if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2> mihomo_err.log; then
-              echo "Conversion successful for: $FILENAME"
+              echo "Success: $FILENAME generated."
+              
+              # 检查内容是否有变化 (通过对比备份文件)
               if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
-                mv "$FILENAME.bak" "$FILENAME.old" 2>/dev/null || true
                 cp "$FILENAME" "$FILENAME.bak"
                 CHANGED=true
                 git add "$FILENAME"
                 ((PROCESSED++))
               fi
             else
-              ERROR_CODE=$?
-              echo "Conversion failed for: $FILENAME (exit code: $ERROR_CODE)"
-              if [ -s mihomo_err.log ]; then
-                echo "Mihomo stderr:"
-                cat mihomo_err.log | sed 's/^/  /'
-              fi
-              rm -f "$FILENAME" mihomo_err.log
-              continue
+              echo "Error: Mihomo conversion failed for $FILENAME"
+              cat mihomo_err.log
             fi
             
-            rm -f temp.txt "$FILENAME.bak" mihomo_err.log
+            rm -f temp_raw.txt temp.txt mihomo_err.log
           done
+          
           set -e
           
+          # 4. 提交并推送更改
           if [[ "$CHANGED" == true ]]; then
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
-            git commit -m "Update $PROCESSED MRS files from TXT URLs [$(date +'%Y-%m-%d')]"
+            git commit -m "Auto-update: $PROCESSED MRS files [$(date +'%Y-%m-%d')]"
             git push
-            echo "Successfully updated $PROCESSED MRS files"
+            echo "Workflow complete. Updated $PROCESSED files."
           else
-            echo "No changes to commit"
+            echo "No changes detected in any rulesets."
           fi
 
       - name: Cleanup
         if: always()
-        run: rm -f temp.txt *.bak mihomo_err.log *.old
+        run: rm -f temp_raw.txt temp.txt *.bak mihomo_err.log
