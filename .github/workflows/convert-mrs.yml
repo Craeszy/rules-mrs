@@ -1,0 +1,78 @@
+name: Convert Multiple TXT to MRS
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每日 UTC 00:00 运行（可选）
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Go (for Mihomo CLI)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Install Mihomo CLI
+        run: |
+          go install github.com/MetaCubeX/mihomo@latest
+          sudo cp ~/go/bin/mihomo /usr/local/bin/
+
+      - name: Process each TXT URL
+        run: |
+          IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
+          DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
+          CHANGED=false
+
+          for URL in "${URLS[@]}"; do
+            # 下载 TXT
+            curl -L -o temp.txt "$URL"
+            
+            # 提取文件名：从 URL 末尾取 basename，去 .txt 加 .mrs
+            FILENAME=$(basename "$URL" .txt).mrs
+            if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi  # 防重复
+            
+            # 判断类型
+            if grep -qiE "(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD)" temp.txt 2>/dev/null; then
+              BEHAVIOR="domain"
+            elif grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp.txt 2>/dev/null; then
+              BEHAVIOR="ipcidr"
+            else
+              BEHAVIOR="$DEFAULT_BEHAVIOR"
+            fi
+            
+            echo "Processing $URL -> $FILENAME (type: $BEHAVIOR)"
+            
+            # 转换
+            mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME"
+            
+            # 如果文件变化，标记为已更改
+            if [[ -f "$FILENAME" && ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
+              cp "$FILENAME" "$FILENAME.bak" || true
+              CHANGED=true
+              git add "$FILENAME"
+            fi
+            
+            rm -f temp.txt "$FILENAME.bak"
+          done
+          
+          # 提交如果有变化
+          if [[ "$CHANGED" == true ]]; then
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git commit -m "Update MRS files from multiple TXT URLs [$(date +'%Y-%m-%d')]"
+            git push
+            echo "Updated $(echo "$CHANGED" | wc -l) MRS files"
+          else
+            echo "No changes to commit"
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: rm -f temp.txt *.bak
