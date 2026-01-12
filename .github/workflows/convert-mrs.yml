@@ -2,9 +2,11 @@ name: Convert Multiple TXT to MRS
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每日 UTC 00:00 运行（可选）
-  workflow_dispatch:  # 允许手动触发
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
+permissions:
+  contents: write
 jobs:
   convert:
     runs-on: ubuntu-latest
@@ -26,14 +28,13 @@ jobs:
 
       - name: Process each TXT URL
         run: |
-          set +e  # 关键：禁用 set -e，让单个失败不中断整体
+          set +e
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
           DEFAULT_BEHAVIOR="${{ vars.DEFAULT_BEHAVIOR || 'domain' }}"
           CHANGED=false
           PROCESSED=0
 
           for RAW_URL in "${URLS[@]}"; do
-            # 清理 URL：修剪空格，跳过空
             URL=$(echo "$RAW_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [ -z "$URL" ]; then
               echo "Skipping empty URL"
@@ -42,37 +43,33 @@ jobs:
             
             echo "Raw URL: '$RAW_URL' -> Cleaned URL: '$URL'"
             
-            # 预验证：检查 URL 格式和可访问性
             if ! [[ "$URL" =~ ^https?:// ]]; then
               echo "Invalid URL format (no http(s)://): $URL"
               continue
             fi
             
-            if ! curl -f -s --head -L --max-time 10 "$URL" >/dev/null 2>&1; then  # 新增：超时 10s
+            if ! curl -f -s --head -L --max-time 10 "$URL" >/dev/null 2>&1; then
               echo "URL not accessible (HEAD check failed): $URL"
               continue
             fi
             
-            # 下载 TXT（新增：移除 BOM）
-            if ! curl -L -o temp.txt -f --max-time 30 "$URL"; then  # 新增：超时 30s
+            if ! curl -L -o temp.txt -f --max-time 30 "$URL"; then
               echo "Failed to download: $URL"
               rm -f temp.txt
               continue
             fi
-            sed -i '1s/^\xEF\xBB\xBF//' temp.txt  # 新增：移除 UTF-8 BOM
+            sed -i '1s/^\xEF\xBB\xBF//' temp.txt
             
-            # 提取文件名
             FILENAME=$(basename "$URL" .txt).mrs
             if [[ "$FILENAME" == *.mrs ]]; then FILENAME=$(basename "$FILENAME" .mrs).mrs; fi
             
-            # 判断类型（仅如果文件非空）+ 调试：echo 前 5 行
             if [ ! -s temp.txt ]; then
               echo "Empty file, skipping: $URL"
               rm -f temp.txt
               continue
             fi
             echo "Sample content (first 5 lines):"
-            head -n 5 temp.txt | sed 's/^/  /'  # 新增：日志调试内容
+            head -n 5 temp.txt | sed 's/^/  /'
             
             if grep -qiE "(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD)" temp.txt 2>/dev/null; then
               BEHAVIOR="domain"
@@ -84,12 +81,10 @@ jobs:
             
             echo "Processing $URL -> $FILENAME (type: $BEHAVIOR)"
             
-            # 转换（关键：捕获输出，失败 continue）
             if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2> mihomo_err.log; then
               echo "Conversion successful for: $FILENAME"
-              # 检查变化
               if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
-                mv "$FILENAME.bak" "$FILENAME.old" 2>/dev/null || true  # 新增：重命名旧备份
+                mv "$FILENAME.bak" "$FILENAME.old" 2>/dev/null || true
                 cp "$FILENAME" "$FILENAME.bak"
                 CHANGED=true
                 git add "$FILENAME"
@@ -100,17 +95,16 @@ jobs:
               echo "Conversion failed for: $FILENAME (exit code: $ERROR_CODE)"
               if [ -s mihomo_err.log ]; then
                 echo "Mihomo stderr:"
-                cat mihomo_err.log | sed 's/^/  /'  # 新增：显示错误详情
+                cat mihomo_err.log | sed 's/^/  /'
               fi
-              rm -f "$FILENAME" mihomo_err.log  # 清理失败文件
-              continue  # 关键：继续下一个 URL
+              rm -f "$FILENAME" mihomo_err.log
+              continue
             fi
             
             rm -f temp.txt "$FILENAME.bak" mihomo_err.log
           done
-          set -e  # 恢复 set -e（可选，后续步骤需严格）
+          set -e
           
-          # 提交如果有变化
           if [[ "$CHANGED" == true ]]; then
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
