@@ -1,8 +1,8 @@
-name: Convert Multiple TXT to MRS (Improved)
+name: Sync and Convert Rulesets (Force Update)
 
 on:
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *' 
   workflow_dispatch:
 
 permissions:
@@ -27,76 +27,73 @@ jobs:
           go install github.com/metacubex/mihomo@latest
           sudo cp ~/go/bin/mihomo /usr/local/bin/
 
-      - name: Process Rulesets
+      - name: Force Process Rulesets
         run: |
           set +e
           IFS=',' read -ra URLS <<< "${{ vars.TXT_URLS }}"
-          CHANGED=false
-          PROCESSED=0
+          PROCESSED_FILES=()
 
           for RAW_URL in "${URLS[@]}"; do
             URL=$(echo "$RAW_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             if [ -z "$URL" ]; then continue; fi
             
+            FILENAME=$(basename "$URL" .txt).mrs
             echo "-------------------------------------------------------"
+            echo "Target: $FILENAME"
             echo "Fetching: $URL"
-            if ! curl -L -o temp_raw.txt -f --max-time 30 "$URL"; then continue; fi
+            
+            if ! curl -L -o temp_raw.txt -f --max-time 30 "$URL"; then
+              echo "Error: Failed to download $URL"
+              continue
+            fi
+            
             sed -i '1s/^\xEF\xBB\xBF//' temp_raw.txt
 
-            # 1. 预判断：是 IP 类规则还是域名类规则
             if grep -qiE "(IP-CIDR|GEOIP|CIDR)" temp_raw.txt 2>/dev/null; then
               BEHAVIOR="ipcidr"
-              echo "Type: IP-CIDR. Stripping prefixes..."
-              # 仅保留 IP 段：移除 IP-CIDR, 前缀和行尾的 ,no-resolve 等参数
+              echo "Mode: IP-CIDR (Stripping to CIDR segments)"
               grep -v '^[[:space:]]*#' temp_raw.txt | grep -v '^[[:space:]]*$' | sed -E '
                   s/^(IP-CIDR|IP-CIDR6|IP-6-CIDR),//gi; 
                   s/,[^, ]+$//g;
               ' > temp.txt
             else
               BEHAVIOR="domain"
-              # 2. 域名类预处理：检查是否已经是字符通配格式
-              # 如果文件中已经包含 "+." 或 "*"，则视为已经是通配符格式
               if grep -qE "(\+\.|\*)" temp_raw.txt; then
-                echo "Type: Domain (Pre-formatted). Skipping modification..."
+                echo "Mode: Domain (Wildcard detected, skip formatting)"
                 cp temp_raw.txt temp.txt
               else
-                echo "Type: Domain (Standard). Applying transformation..."
-                # 处理逻辑：
-                # - DOMAIN-KEYWORD -> *keyword*
-                # - DOMAIN-SUFFIX -> +.domain
-                # - DOMAIN -> 保持原样 (仅移除 DOMAIN, 前缀以符合 Mihomo 格式)
+                echo "Mode: Domain (Applying specific transformations)"
+                # DOMAIN-SUFFIX -> +.
+                # DOMAIN-KEYWORD -> **
+                # DOMAIN -> keep original
                 grep -v '^[[:space:]]*#' temp_raw.txt | grep -v '^[[:space:]]*$' | sed -E '
                     /^DOMAIN-KEYWORD,/ { s/^DOMAIN-KEYWORD,([^,]+).*/\*\1\*/; b; }
                     /^DOMAIN-SUFFIX,/ { s/^DOMAIN-SUFFIX,([^,]+).*/\+\.\1/; b; }
                     /^DOMAIN,/ { s/^DOMAIN,([^,]+).*/\1/; b; }
-                    # 如果是没有前缀的纯域名，按 DOMAIN 处理，不加通配符
                     s/^[[:space:]]*//;
                 ' > temp.txt
               fi
             fi
 
-            # 3. 编译 MRS
-            FILENAME=$(basename "$URL" .txt).mrs
             if mihomo convert-ruleset "$BEHAVIOR" text temp.txt "$FILENAME" 2>/dev/null; then
-              echo "Successfully converted: $FILENAME"
-              if [[ ! -f "$FILENAME.bak" ]] || ! cmp -s "$FILENAME" "$FILENAME.bak" 2>/dev/null; then
-                cp "$FILENAME" "$FILENAME.bak"
-                CHANGED=true
-                git add "$FILENAME"
-                ((PROCESSED++))
-              fi
+              echo "Success: $FILENAME has been replaced."
+              git add "$FILENAME"
+              PROCESSED_FILES+=("$FILENAME")
+            else
+              echo "Error: Failed to convert $FILENAME"
             fi
+            
             rm -f temp_raw.txt temp.txt
           done
-          
-          if [[ "$CHANGED" == true ]]; then
+
+          if [ ${#PROCESSED_FILES[@]} -gt 0 ]; then
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
-            git commit -m "Ruleset Update: $PROCESSED files [$(date +'%Y-%m-%d')]"
+            git commit -m "Auto-update: Refresh MRS files [$(date +'%Y-%m-%d %H:%M')]" || echo "No actual content changes to commit."
             git push
           fi
           set -e
 
-      - name: Cleanup
+      - name: Final Cleanup
         if: always()
-        run: rm -f temp_raw.txt temp.txt *.bak
+        run: rm -f temp_raw.txt temp.txt
